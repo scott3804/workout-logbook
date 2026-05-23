@@ -1,8 +1,10 @@
+// src/App.tsx
 import { useState, useEffect } from "react";
-import type { Workout, Exercise, SetEntry } from "./types";
+import { fetchExerciseMetadata } from "./services/workoutService";
+import type { Workout } from "./types"; // Strict type-only import
 
-// Seed initial data if localStorage is empty to test the clipboard immediately
-const MOCK_DATA: Workout[] = [
+// Hydrate default prototype feed layout if remote collection yields nothing initially
+const SEED_WORKOUTS: Workout[] = [
   {
     workoutId: "2026-05-24-workout-a",
     date: "2026-05-24",
@@ -24,18 +26,37 @@ const MOCK_DATA: Workout[] = [
 ];
 
 export default function App() {
-  const [workouts, setWorkouts] = useState<Workout[]>(() => {
-    const saved = localStorage.getItem("workouts");
-    return saved ? JSON.parse(saved) : MOCK_DATA;
+  // 1. Initialize core state values
+  const [workouts, setWorkouts] = useState<Workout[]>(SEED_WORKOUTS);
+  const [exerciseMeta, setExerciseMeta] = useState<any>({
+    exerciseNames: [],
+    records: {},
   });
+  const [loading, setLoading] = useState<boolean>(true);
   const [copyStatus, setCopyStatus] = useState<string>("Copy Last 10 Workouts");
 
-  useEffect(() => {
-    localStorage.setItem("workouts", JSON.stringify(workouts));
-  }, [workouts]);
+  // Hardcoded identifier context for our current prototype sandbox mapping stage
+  const userId = "scott_milholland_dev";
 
+  // 2. Stream down our historical exercise records from Cloud Firestore
+  useEffect(() => {
+    async function loadInitialData() {
+      try {
+        const meta = await fetchExerciseMetadata(userId);
+        if (meta && meta.exerciseNames.length > 0) {
+          setExerciseMeta(meta);
+        }
+      } catch (error) {
+        console.error("Error communicating with Cloud Firestore: ", error);
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadInitialData();
+  }, []);
+
+  // 3. Coordinate clipboard data formatting string conversions
   const copyToClipboard = async () => {
-    // Sort descending by date and slice the top 10 rows
     const targetedWorkouts = [...workouts]
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, 10);
@@ -48,9 +69,17 @@ export default function App() {
       setTimeout(() => setCopyStatus("Copy Last 10 Workouts"), 2000);
     } catch (err) {
       setCopyStatus("Copy Failed ✗");
-      console.error("Failed to copy text: ", err);
+      console.error("Failed to copy compilation string: ", err);
     }
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-gray-400 flex items-center justify-center font-sans tracking-wide">
+        Loading database configurations...
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4 font-sans">
@@ -59,7 +88,7 @@ export default function App() {
           FlexLog
         </h1>
         <p className="text-xs text-gray-400 mt-1">
-          Prototype V1.0 (Local Storage)
+          Prototype V1.1 (Firestore Ready)
         </p>
       </header>
 
@@ -72,7 +101,7 @@ export default function App() {
           {copyStatus}
         </button>
 
-        {/* Workout Feed */}
+        {/* Workout Feed UI */}
         <div className="space-y-4">
           <h2 className="text-lg font-semibold text-gray-300">
             Workout History
