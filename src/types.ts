@@ -1,3 +1,6 @@
+// src/types.ts
+import type { Timestamp } from "firebase/firestore"; // Type-only import
+
 export interface SetEntry {
   setNum: number;
   weightLbs: number;
@@ -18,4 +21,17 @@ export interface Workout {
   bodyWeightLbs: number;
   notes: string;
   exercises: Exercise[];
+}
+
+export interface PersonalRecord {
+  maxWeightLbs: number;
+  achievedDate: string;
+  bestEstimated1RM: number;
+}
+
+// Fixed: Swapped out 'any' for the official Firestore Timestamp type
+export interface ExerciseMetadata {
+  exerciseNames: string[];
+  records: Record<string, PersonalRecord>;
+  lastUpdated?: Timestamp;
 }

@@ -1,3 +1,4 @@
+// src/services/workoutService.ts
 import {
   doc,
   getDoc,
@@ -6,56 +7,42 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import { db } from "../../firebaseConfig";
-import type { Workout, Exercise } from "../types"; // Strict type-only import
+import type { Workout, Exercise, ExerciseMetadata } from "../types"; // Type-only imports
 
-// Helper formula to calculate Estimated 1-Rep Max (Brzycki Equation)
 function calculate1RM(weight: number, reps: number): number {
   if (reps <= 1) return weight;
   return Math.round(weight / (1.0278 - 0.0278 * reps));
 }
 
-/**
- * Fetches the single master metadata document containing the list
- * of unique exercise names and lifetime personal records.
- * Costs exactly 1 document read.
- */
-export async function fetchExerciseMetadata(userId: string) {
+export async function fetchExerciseMetadata(
+  userId: string,
+): Promise<ExerciseMetadata> {
   const metaRef = doc(db, `users/${userId}/meta/exercises`);
   const metaSnap = await getDoc(metaRef);
 
   if (metaSnap.exists()) {
-    return metaSnap.data();
+    return metaSnap.data() as ExerciseMetadata;
   }
   return { exerciseNames: [], records: {} };
 }
 
-/**
- * Saves a complete workout session across three optimized targets
- * using a single, atomic database batch operation.
- * Total Cost: 3 Document Writes. 0 Document Reads.
- */
 export async function saveWorkoutSession(
   userId: string,
   workoutData: Workout,
-  currentMeta: any,
+  currentMeta: ExerciseMetadata, // Swapped 'any' for strict ExerciseMetadata type
 ): Promise<void> {
   const batch = writeBatch(db);
   const dateId = workoutData.date;
 
-  // 1. Write the primary workout log for trainer copy/paste actions
   const workoutRef = doc(
     db,
     `users/${userId}/workouts/${dateId}-${workoutData.routine.toLowerCase().replace(/\s+/g, "-")}`,
   );
-  batch.set(workoutRef, {
-    ...workoutData,
-    createdAt: Timestamp.now(),
-  });
+  batch.set(workoutRef, { ...workoutData, createdAt: Timestamp.now() });
 
   const uniqueNames: string[] = [];
-  const updatedRecords = { ...currentMeta?.records };
+  const updatedRecords = { ...currentMeta.records };
 
-  // 2. Loop through exercises to construct lightweight chart snapshots
   workoutData.exercises.forEach((ex: Exercise) => {
     uniqueNames.push(ex.name);
 
@@ -78,7 +65,6 @@ export async function saveWorkoutSession(
       bestEstimated1RM: max1RM,
     };
 
-    // Append history line item directly to the exercise's dedicated chart array doc
     const exerciseSlug = ex.name.toLowerCase().replace(/\s+/g, "-");
     const chartRef = doc(db, `users/${userId}/exercises/${exerciseSlug}`);
     batch.set(
@@ -90,7 +76,6 @@ export async function saveWorkoutSession(
       { merge: true },
     );
 
-    // Assess and update personal record metrics
     const pastBest = updatedRecords[ex.name]?.bestEstimated1RM || 0;
     if (max1RM > pastBest) {
       updatedRecords[ex.name] = {
@@ -101,7 +86,6 @@ export async function saveWorkoutSession(
     }
   });
 
-  // 3. Commit unique text names back to the primary dropdown metadata record
   const metaRef = doc(db, `users/${userId}/meta/exercises`);
   batch.set(
     metaRef,
@@ -113,6 +97,5 @@ export async function saveWorkoutSession(
     { merge: true },
   );
 
-  // Atomic confirmation execution
   await batch.commit();
 }
