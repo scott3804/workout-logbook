@@ -1,13 +1,34 @@
 // src/App.tsx
 import { useState, useEffect } from "react";
+import { onAuthStateChanged } from "firebase/auth";
+import {
+  collection,
+  query,
+  orderBy,
+  limit,
+  onSnapshot,
+} from "firebase/firestore";
+import { db } from "./firebaseConfig";
+import { auth, signInWithGoogle, logoutUser } from "./services/authService";
 import {
   fetchExerciseMetadata,
-  saveWorkoutSession,
+  saveCompleteWorkout,
 } from "./services/workoutService";
+import type { User } from "firebase/auth";
 import type { Workout, Exercise, ExerciseMetadata, SetEntry } from "./types";
 
+// Strict interface for native browser installation events
+interface BeforeInstallPromptEvent extends Event {
+  readonly platforms: string[];
+  readonly userChoice: Promise<{
+    outcome: "accepted" | "dismissed";
+    platform: string;
+  }>;
+  prompt(): Promise<void>;
+}
+
 export default function App() {
-  // Core tracking states
+  const [user, setUser] = useState<User | null>(null);
   const [workouts, setWorkouts] = useState<Workout[]>([]);
   const [exerciseMeta, setExerciseMeta] = useState<ExerciseMetadata>({
     exerciseNames: [],
@@ -16,93 +37,267 @@ export default function App() {
   const [loading, setLoading] = useState<boolean>(true);
   const [copyStatus, setCopyStatus] = useState<string>("Copy Last 10 Workouts");
 
-  // Active form state variables
+  // PWA Native Installation State Tracker
+  const [deferredPrompt, setDeferredPrompt] =
+    useState<BeforeInstallPromptEvent | null>(null);
+  const [isInstallable, setIsInstallable] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      return !window.matchMedia("(display-mode: standalone)").matches;
+    }
+    return false;
+  });
+
+  // Workout Session Headers
   const [routine, setRoutine] = useState("Workout A");
   const [bodyWeight, setBodyWeight] = useState("227");
   const [notes, setNotes] = useState("");
+
+  // Staged workout array
+  const [activeExercises, setActiveExercises] = useState<Exercise[]>(() => {
+    const saved = localStorage.getItem("active_session_exercises");
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  // Entry Form States
+  const [exerciseType, setExerciseType] = useState<"strength" | "cardio">(
+    "strength",
+  );
   const [exerciseName, setExerciseName] = useState("");
-  const [weight, setWeight] = useState("");
-  const [reps, setReps] = useState("");
+  const [exerciseNotes, setExerciseNotes] = useState("");
 
-  const userId = "scott_milholland_dev";
+  // Strength Dynamic Set Rows
+  const [sets, setSets] = useState<SetEntry[]>([
+    { setNum: 1, weightLbs: 0, reps: 0, rpe: 8 },
+  ]);
 
+  // Cardio Input Fields
+  const [distance, setDistance] = useState("");
+  const [duration, setDuration] = useState("");
+
+  // 1. Capture PWA Installation Handshake Prompts
   useEffect(() => {
-    async function loadInitialData() {
-      try {
-        const meta = await fetchExerciseMetadata(userId);
-        setExerciseMeta(meta);
-      } catch (error) {
-        console.error("Error communicating with Cloud Firestore: ", error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    loadInitialData();
-  }, []);
-
-  const handleLogWorkout = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!exerciseName.trim() || !weight || !reps) return;
-
-    const todayStr = new Date().toISOString().split("T")[0];
-
-    const sets: SetEntry[] = [
-      {
-        setNum: 1,
-        weightLbs: parseFloat(weight),
-        reps: parseInt(reps),
-        rpe: 9,
-      },
-    ];
-
-    const targetExercise: Exercise = {
-      name: exerciseName,
-      tempo: "3110",
-      sets,
+    const handleBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferredPrompt(e as BeforeInstallPromptEvent);
+      setIsInstallable(true);
     };
 
-    const newWorkout: Workout = {
-      workoutId: `${todayStr}-${routine.toLowerCase().replace(/\s+/g, "-")}`,
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+
+    return () =>
+      window.removeEventListener(
+        "beforeinstallprompt",
+        handleBeforeInstallPrompt,
+      );
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "active_session_exercises",
+      JSON.stringify(activeExercises),
+    );
+  }, [activeExercises]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      if (!currentUser) setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    async function loadMeta() {
+      const meta = await fetchExerciseMetadata(user!.uid);
+      setExerciseMeta(meta);
+    }
+    loadMeta();
+
+    const workoutsRef = collection(db, `users/${user.uid}/workouts`);
+    const q = query(workoutsRef, orderBy("date", "desc"), limit(10));
+    const unsubscribeHistory = onSnapshot(q, (snapshot) => {
+      const historyList: Workout[] = [];
+      snapshot.forEach((doc) => historyList.push(doc.data() as Workout));
+      setWorkouts(historyList);
+      setLoading(false);
+    });
+    return () => unsubscribeHistory();
+  }, [user]);
+
+  // UX Fix: Dynamically combine options AND filter them based on the active UI selection type
+  const getFilteredDropdownOptions = () => {
+    const remoteNames = exerciseMeta.exerciseNames.map((ex) => ({
+      name: ex.name,
+      type: ex.type,
+    }));
+
+    activeExercises.forEach((stagedEx) => {
+      const exists = remoteNames.some(
+        (r) => r.name.toLowerCase() === stagedEx.name.toLowerCase(),
+      );
+      if (!exists) {
+        remoteNames.push({ name: stagedEx.name, type: stagedEx.type });
+      }
+    });
+
+    // Filter list so it only displays exercises matching the current tab selection!
+    return remoteNames
+      .filter((ex) => ex.type === exerciseType)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  };
+
+  const handleManualTypeToggle = (type: "strength" | "cardio") => {
+    setExerciseType(type);
+    setExerciseName("");
+    setExerciseNotes("");
+    setDistance("");
+    setDuration("");
+    setSets([{ setNum: 1, weightLbs: 0, reps: 0, rpe: 8 }]);
+  };
+
+  const handleExerciseNameChange = (inputVal: string) => {
+    setExerciseName(inputVal);
+    const allAvailableOptions = getFilteredDropdownOptions();
+    const matchedExercise = allAvailableOptions.find(
+      (ex) => ex.name.toLowerCase() === inputVal.trim().toLowerCase(),
+    );
+    if (matchedExercise) {
+      setExerciseType(matchedExercise.type);
+    }
+  };
+
+  const handleSetChange = (
+    index: number,
+    field: keyof SetEntry,
+    value: number,
+  ) => {
+    const updatedSets = [...sets];
+    updatedSets[index] = { ...updatedSets[index], [field]: value };
+    setSets(updatedSets);
+  };
+
+  const handleRemoveLastSetRow = () => {
+    if (sets.length > 1) {
+      setSets(sets.slice(0, -1));
+    }
+  };
+
+  // Trigger Native Mobile Browser Installation Interface
+  const handleTriggerAppInstall = async () => {
+    if (!deferredPrompt) return;
+
+    await deferredPrompt.prompt();
+    const choiceResult = await deferredPrompt.userChoice;
+
+    if (choiceResult.outcome === "accepted") {
+      console.log("User installed the FlexLog PWA application token.");
+      setIsInstallable(false);
+    }
+    setDeferredPrompt(null);
+  };
+
+  const handleStageExercise = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!exerciseName.trim()) return;
+
+    const targetName = exerciseName.trim();
+    const updatedExercises = [...activeExercises];
+
+    if (exerciseType === "strength") {
+      const filteredSets = sets.filter((s) => s.reps > 0);
+      if (filteredSets.length === 0) {
+        alert("Please enter at least one valid set row.");
+        return;
+      }
+
+      const existingIndex = updatedExercises.findIndex(
+        (ex) =>
+          ex.name.toLowerCase() === targetName.toLowerCase() &&
+          ex.type === "strength",
+      );
+
+      if (existingIndex !== -1) {
+        const baseExercise = updatedExercises[existingIndex];
+        const startingSetNum = baseExercise.sets ? baseExercise.sets.length : 0;
+        const freshSets = filteredSets.map((s, idx) => ({
+          ...s,
+          setNum: startingSetNum + idx + 1,
+        }));
+
+        updatedExercises[existingIndex] = {
+          ...baseExercise,
+          sets: [...(baseExercise.sets || []), ...freshSets],
+          exerciseNotes: exerciseNotes.trim()
+            ? `${baseExercise.exerciseNotes || ""}; ${exerciseNotes}`.replace(
+                /^;\s*/,
+                "",
+              )
+            : baseExercise.exerciseNotes,
+        };
+      } else {
+        updatedExercises.push({
+          name: targetName,
+          type: "strength",
+          tempo: "3110",
+          sets: filteredSets,
+          ...(exerciseNotes.trim() ? { exerciseNotes } : {}),
+        });
+      }
+    } else {
+      if (!distance || !duration) {
+        alert("Please enter both distance and duration numbers.");
+        return;
+      }
+      updatedExercises.push({
+        name: targetName,
+        type: "cardio",
+        distanceMiles: parseFloat(distance),
+        timeMinutes: parseFloat(duration),
+        ...(exerciseNotes.trim() ? { exerciseNotes } : {}),
+      });
+    }
+
+    setActiveExercises(updatedExercises);
+    setExerciseName("");
+    setExerciseNotes("");
+    setDistance("");
+    setDuration("");
+    setSets([{ setNum: 1, weightLbs: 0, reps: 0, rpe: 8 }]);
+  };
+
+  const handleSubmitEntireWorkout = async () => {
+    if (!user || activeExercises.length === 0) return;
+
+    const now = new Date();
+    const todayStr = now.toISOString().split("T")[0];
+    const timestampId = now.toISOString().replace(/[:.]/g, "-");
+
+    const finalWorkoutPayload: Workout = {
+      workoutId: `${timestampId}-${routine.toLowerCase().replace(/\s+/g, "-")}`,
       date: todayStr,
       routine,
       bodyWeightLbs: parseFloat(bodyWeight) || 0,
       notes,
-      exercises: [targetExercise],
+      exercises: activeExercises,
     };
 
     try {
-      // Actively uses our save service layer and updates state arrays
-      await saveWorkoutSession(userId, newWorkout, exerciseMeta);
-      setWorkouts([newWorkout, ...workouts]);
-
-      // Refresh local dropdown metadata cache automatically
-      if (!exerciseMeta.exerciseNames.includes(exerciseName)) {
-        setExerciseMeta((prev) => ({
-          ...prev,
-          exerciseNames: [...prev.exerciseNames, exerciseName].sort(),
-        }));
-      }
-
-      // Reset entry inputs
-      setExerciseName("");
-      setWeight("");
-      setReps("");
+      await saveCompleteWorkout(user.uid, finalWorkoutPayload, exerciseMeta);
+      const metaRefresh = await fetchExerciseMetadata(user.uid);
+      setExerciseMeta(metaRefresh);
+      setActiveExercises([]);
       setNotes("");
+      localStorage.removeItem("active_session_exercises");
+      alert("Workout saved securely to the Cloud! 🎉");
     } catch (err) {
-      console.error("Failed to persist log entry: ", err);
+      console.error("Batch submission failed: ", err);
     }
   };
 
   const copyToClipboard = async () => {
-    const dataPool = workouts.length > 0 ? workouts : SEED_FALLBACK;
-    const targetedWorkouts = [...dataPool]
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-      .slice(0, 10);
-
     try {
-      await navigator.clipboard.writeText(
-        JSON.stringify(targetedWorkouts, null, 2),
-      );
+      await navigator.clipboard.writeText(JSON.stringify(workouts, null, 2));
       setCopyStatus("Copied to Clipboard! ✓");
       setTimeout(() => setCopyStatus("Copy Last 10 Workouts"), 2000);
     } catch (err) {
@@ -111,183 +306,402 @@ export default function App() {
     }
   };
 
-  if (loading) {
+  if (loading)
     return (
       <div className="min-h-screen bg-gray-900 text-gray-400 flex items-center justify-center font-sans">
-        Loading database...
+        Booting FlexLog...
+      </div>
+    );
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center justify-center p-6 font-sans">
+        <div className="max-w-sm w-full text-center space-y-6 bg-gray-800 p-8 rounded-2xl border border-gray-700 shadow-xl">
+          <h1 className="text-4xl font-black text-emerald-400 tracking-tight">
+            FlexLog
+          </h1>
+          <p className="text-sm text-gray-400">
+            Hybrid strength & cardio tracker. Intelligent layout adapting to
+            your selections instantly.
+          </p>
+          <button
+            onClick={signInWithGoogle}
+            className="w-full bg-emerald-600 hover:bg-emerald-500 font-bold py-3 px-4 rounded-xl transition shadow-md"
+          >
+            Sign In With Google
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4 font-sans">
-      <header className="max-w-md mx-auto mb-6 flex flex-col items-center border-b border-gray-800 pb-4">
-        <h1 className="text-2xl font-bold text-emerald-400">FlexLog</h1>
-        <p className="text-xs text-gray-400 mt-1">
-          Prototype V1.2 (Strict TS Verified)
-        </p>
+      <header className="max-w-md mx-auto mb-6 flex items-center justify-between border-b border-gray-800 pb-4">
+        <div>
+          <h1 className="text-2xl font-black text-emerald-400">FlexLog</h1>
+          <p className="text-[10px] text-gray-400">
+            Athlete: {user.displayName}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Action Button: Renders cleanly ONLY if mobile browser gives install capabilities */}
+          {isInstallable && (
+            <button
+              onClick={handleTriggerAppInstall}
+              className="text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg transition shadow"
+            >
+              📲 Install App
+            </button>
+          )}
+          <button
+            onClick={logoutUser}
+            className="text-xs border border-gray-700 hover:border-red-500 text-gray-400 hover:text-red-400 px-3 py-1.5 rounded-lg transition"
+          >
+            Logout
+          </button>
+        </div>
       </header>
 
       <main className="max-w-md mx-auto space-y-6">
-        {/* Dynamic Log Entry Box */}
-        <form
-          onSubmit={handleLogWorkout}
-          className="bg-gray-800 p-4 rounded-xl border border-gray-700 space-y-3 shadow-md"
-        >
-          <h2 className="text-sm font-bold uppercase text-emerald-400 tracking-wider">
-            Log Current Session
-          </h2>
+        {/* Profile Settings */}
+        <div className="bg-gray-900/40 p-3 rounded-xl border border-gray-800 grid grid-cols-2 gap-2">
+          <div>
+            <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-0.5">
+              Session Routine
+            </label>
+            <input
+              type="text"
+              value={routine}
+              onChange={(e) => setRoutine(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded-md p-1.5 text-xs text-emerald-400 font-bold focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-0.5">
+              Scale Weight (lbs)
+            </label>
+            <input
+              type="number"
+              value={bodyWeight}
+              onChange={(e) => setBodyWeight(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded-md p-1.5 text-xs focus:outline-none"
+            />
+          </div>
+        </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="block text-[10px] uppercase text-gray-400 mb-1">
-                Routine
-              </label>
-              <input
-                type="text"
-                value={routine}
-                onChange={(e) => setRoutine(e.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-[10px] uppercase text-gray-400 mb-1">
-                Bodyweight (lbs)
-              </label>
-              <input
-                type="number"
-                value={bodyWeight}
-                onChange={(e) => setBodyWeight(e.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
-              />
-            </div>
+        {/* Unified Input Box */}
+        <form
+          onSubmit={handleStageExercise}
+          className="bg-gray-800 p-4 rounded-xl border border-gray-700 space-y-4 shadow-md"
+        >
+          <div className="flex bg-gray-900 p-1 rounded-lg border border-gray-750">
+            <button
+              type="button"
+              onClick={() => handleManualTypeToggle("strength")}
+              className={`flex-1 text-center py-1.5 rounded-md text-xs font-bold transition ${exerciseType === "strength" ? "bg-emerald-600 text-white shadow-sm" : "text-gray-400 hover:text-gray-200"}`}
+            >
+              Strength
+            </button>
+            <button
+              type="button"
+              onClick={() => handleManualTypeToggle("cardio")}
+              className={`flex-1 text-center py-1.5 rounded-md text-xs font-bold transition ${exerciseType === "cardio" ? "bg-emerald-600 text-white shadow-sm" : "text-gray-400 hover:text-gray-200"}`}
+            >
+              Cardio
+            </button>
           </div>
 
           <div>
-            <label className="block text-[10px] uppercase text-gray-400 mb-1">
+            <label className="block text-[10px] uppercase text-gray-400 mb-1 font-medium">
               Exercise Name
             </label>
             <input
               type="text"
               list="past-exercises"
               value={exerciseName}
-              onChange={(e) => setExerciseName(e.target.value)}
-              placeholder="e.g., Dumbbell Bench Press"
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
+              onChange={(e) => handleExerciseNameChange(e.target.value)}
+              placeholder={
+                exerciseType === "strength"
+                  ? "e.g., Dumbbell Bench"
+                  : "e.g., Treadmill Rucking"
+              }
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none focus:border-emerald-500"
               required
             />
             <datalist id="past-exercises">
-              {exerciseMeta.exerciseNames.map((name) => (
-                <option key={name} value={name} />
+              {/* Feature Update: choice options are filtered in real-time by current selection tab */}
+              {getFilteredDropdownOptions().map((ex) => (
+                <option key={ex.name} value={ex.name} />
               ))}
             </datalist>
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="block text-[10px] uppercase text-gray-400 mb-1">
-                Weight (lbs)
-              </label>
-              <input
-                type="number"
-                value={weight}
-                onChange={(e) => setWeight(e.target.value)}
-                placeholder="0"
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
-                required
-              />
+          {/* Conditional Input Fields */}
+          {exerciseType === "strength" ? (
+            <div className="space-y-2">
+              <div className="grid grid-cols-4 text-center text-[10px] uppercase font-bold text-gray-500">
+                <div>Set</div>
+                <div>Lbs</div>
+                <div>Reps</div>
+                <div>RPE</div>
+              </div>
+              {sets.map((set, i) => (
+                <div
+                  key={set.setNum}
+                  className="grid grid-cols-4 gap-2 items-center text-center"
+                >
+                  <span className="text-sm font-mono text-gray-500">
+                    {set.setNum}
+                  </span>
+                  <input
+                    type="number"
+                    required
+                    placeholder="0 (BW)"
+                    value={set.weightLbs === 0 ? "0" : set.weightLbs || ""}
+                    onChange={(e) =>
+                      handleSetChange(
+                        i,
+                        "weightLbs",
+                        e.target.value === "" ? 0 : parseFloat(e.target.value),
+                      )
+                    }
+                    className="bg-gray-900 border border-gray-700 rounded p-1 text-center font-mono text-sm focus:border-emerald-500"
+                  />
+                  <input
+                    type="number"
+                    required
+                    placeholder="reps"
+                    value={set.reps || ""}
+                    onChange={(e) =>
+                      handleSetChange(
+                        i,
+                        "reps",
+                        e.target.value === "" ? 0 : parseInt(e.target.value),
+                      )
+                    }
+                    className="bg-gray-900 border border-gray-700 rounded p-1 text-center font-mono text-sm focus:border-emerald-500"
+                  />
+                  <input
+                    type="number"
+                    required
+                    min="1"
+                    max="10"
+                    value={set.rpe}
+                    onChange={(e) =>
+                      handleSetChange(i, "rpe", parseInt(e.target.value) || 8)
+                    }
+                    className="bg-gray-900 border border-gray-700 rounded p-1 text-center font-mono text-sm text-amber-400 focus:border-emerald-500"
+                  />
+                </div>
+              ))}
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSets([
+                      ...sets,
+                      {
+                        setNum: sets.length + 1,
+                        weightLbs: 0,
+                        reps: 0,
+                        rpe: 8,
+                      },
+                    ])
+                  }
+                  className="flex-1 bg-gray-700 hover:bg-gray-650 text-[11px] py-1.5 rounded-md transition text-gray-300 font-medium"
+                >
+                  + Add Set Row
+                </button>
+                {sets.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={handleRemoveLastSetRow}
+                    className="flex-1 bg-gray-900 border border-gray-700 hover:border-red-900 text-[11px] py-1.5 rounded-md transition text-red-400 font-medium"
+                  >
+                    ✕ Remove Last
+                  </button>
+                )}
+              </div>
             </div>
-            <div>
-              <label className="block text-[10px] uppercase text-gray-400 mb-1">
-                Reps
-              </label>
-              <input
-                type="number"
-                value={reps}
-                onChange={(e) => setReps(e.target.value)}
-                placeholder="0"
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
-                required
-              />
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] uppercase text-gray-400 mb-1">
+                    Distance (Miles)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={distance}
+                    onChange={(e) => setDistance(e.target.value)}
+                    placeholder="1.0"
+                    className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] uppercase text-gray-400 mb-1">
+                    Duration (Minutes)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={duration}
+                    onChange={(e) => setDuration(e.target.value)}
+                    placeholder="23.5"
+                    className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
+                  />
+                </div>
+              </div>
             </div>
-          </div>
+          )}
 
           <div>
             <label className="block text-[10px] uppercase text-gray-400 mb-1">
-              Session Notes
+              Exercise Specific Notes
             </label>
             <input
               type="text"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="How did the stabilizers feel?"
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-sm focus:outline-none"
+              value={exerciseNotes}
+              onChange={(e) => setExerciseNotes(e.target.value)}
+              placeholder={
+                exerciseType === "strength"
+                  ? "e.g., Using 40lb vest / Wide grip bar"
+                  : "e.g., Incline 10%, Speed 2.7mph, 40lb vest"
+              }
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-xs focus:outline-none focus:border-emerald-500"
             />
           </div>
 
           <button
             type="submit"
-            className="w-full bg-blue-600 hover:bg-blue-500 font-medium py-2 rounded-lg text-sm mt-2 transition"
+            className="w-full bg-emerald-600 hover:bg-emerald-500 font-bold py-2 rounded-lg text-xs transition uppercase tracking-wider"
           >
-            Save Entry to Cloud
+            Stage Exercise to Session
           </button>
         </form>
 
-        <button
-          onClick={copyToClipboard}
-          className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium py-3 px-4 rounded-xl transition shadow-lg"
-        >
-          {copyStatus}
-        </button>
-
-        {/* Local Feed Rendering Display */}
-        <div className="space-y-3">
-          <h3 className="text-md font-semibold text-gray-300">
-            Session History feed
-          </h3>
-          {(workouts.length > 0 ? workouts : SEED_FALLBACK).map((workout) => (
-            <div
-              key={workout.workoutId}
-              className="bg-gray-800/60 p-4 rounded-xl border border-gray-750"
-            >
-              <div className="flex justify-between items-baseline mb-1">
-                <span className="font-bold text-gray-200">
-                  {workout.routine}
-                </span>
-                <span className="text-xs text-emerald-400 font-mono">
-                  {workout.date}
-                </span>
-              </div>
-              {workout.exercises.map((ex, i) => (
+        {/* Staging Area Overview */}
+        {activeExercises.length > 0 && (
+          <div className="bg-blue-950/30 border border-blue-900/60 p-4 rounded-xl space-y-3">
+            <h3 className="text-sm font-bold text-blue-400 uppercase tracking-wide border-b border-blue-900/40 pb-2">
+              Current Active Session ({activeExercises.length})
+            </h3>
+            <div className="space-y-2 max-h-48 overflow-y-auto">
+              {activeExercises.map((ex, idx) => (
                 <div
-                  key={i}
-                  className="text-sm text-gray-300 mt-1 pl-2 border-l border-emerald-500"
+                  key={idx}
+                  className="text-xs bg-gray-900/50 p-2 rounded border border-gray-800"
                 >
-                  {ex.name} — {ex.sets[0].weightLbs} lbs × {ex.sets[0].reps}{" "}
-                  reps
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-bold mr-2 ${ex.type === "strength" ? "bg-amber-600/30 text-amber-400" : "bg-cyan-600/30 text-cyan-400"}`}
+                  >
+                    {ex.type}
+                  </span>
+                  <span className="font-bold text-gray-200">{ex.name}</span>
+                  <p className="text-gray-400 font-mono text-[11px] mt-0.5">
+                    {ex.type === "strength"
+                      ? ex.sets
+                          ?.map((s) => `${s.weightLbs}x${s.reps}`)
+                          .join(" | ")
+                      : `${ex.distanceMiles} miles in ${ex.timeMinutes} mins`}
+                  </p>
+                  {ex.exerciseNotes && (
+                    <p className="text-[10px] text-gray-500 italic mt-0.5">
+                      Note: "{ex.exerciseNotes}"
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
-          ))}
+            <div>
+              <label className="block text-[10px] uppercase text-gray-400 mb-1">
+                Overall Session Comments
+              </label>
+              <input
+                type="text"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Felt warm, adjustments made..."
+                className="w-full bg-gray-900 border border-gray-700 rounded-lg p-2 text-xs focus:outline-none"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleSubmitEntireWorkout}
+              className="w-full bg-blue-600 hover:bg-blue-500 font-black py-3 rounded-xl text-sm uppercase transition shadow-lg"
+            >
+              🚀 Submit & End Workout
+            </button>
+          </div>
+        )}
+
+        <button
+          onClick={copyToClipboard}
+          className="w-full bg-gray-800 border border-gray-700 hover:bg-gray-750 font-bold py-3.5 px-4 rounded-xl transition text-emerald-400 flex items-center justify-center gap-2 shadow-lg"
+        >
+          <span>📋</span> {copyStatus}
+        </button>
+
+        {/* History Feed */}
+        <div className="space-y-3">
+          <h3 className="text-md font-bold text-gray-400 tracking-wide uppercase text-xs">
+            Cloud History Log Feed
+          </h3>
+          {workouts.length === 0 ? (
+            <p className="text-sm text-gray-500 text-center py-4 italic">
+              No cloud logs verified yet.
+            </p>
+          ) : (
+            workouts.map((workout) => (
+              <div
+                key={workout.workoutId}
+                className="bg-gray-800 p-4 rounded-xl border border-gray-700 shadow-sm"
+              >
+                <div className="flex justify-between items-baseline mb-1">
+                  <span className="font-bold text-lg text-gray-100">
+                    {workout.routine}
+                  </span>
+                  <span className="text-xs text-emerald-400 font-mono font-bold">
+                    {workout.date}
+                  </span>
+                </div>
+                {workout.notes && (
+                  <p className="text-xs italic text-gray-400 bg-gray-900/40 p-2 rounded-lg border-l border-emerald-500 mb-2">
+                    "{workout.notes}"
+                  </p>
+                )}
+                {workout.exercises.map((ex, i) => (
+                  <div
+                    key={i}
+                    className="bg-gray-900/50 p-2 rounded-lg border border-gray-750 mt-1 text-xs"
+                  >
+                    <span className="font-bold text-gray-200">{ex.name}</span>
+                    <span className="text-[10px] text-gray-500 uppercase ml-2">
+                      ({ex.type})
+                    </span>
+                    <p className="font-mono text-[11px] text-emerald-400 mt-0.5">
+                      {ex.type === "strength"
+                        ? ex.sets
+                            ?.map((s) => `${s.weightLbs} lbs × ${s.reps}`)
+                            .join(" | ")
+                        : `${ex.distanceMiles} miles / ${ex.timeMinutes} mins`}
+                    </p>
+                    {ex.exerciseNotes && (
+                      <p className="text-[10px] text-gray-400 italic bg-gray-900/20 p-1 rounded mt-1">
+                        ↳ "{ex.exerciseNotes}"
+                      </p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ))
+          )}
         </div>
       </main>
     </div>
   );
 }
-
-const SEED_FALLBACK: Workout[] = [
-  {
-    workoutId: "demo-id",
-    date: "2026-05-24",
-    routine: "Workout A",
-    bodyWeightLbs: 227.0,
-    notes: "Initial backup trace preset",
-    exercises: [
-      {
-        name: "Flat Dumbbell Bench Press",
-        tempo: "3110",
-        sets: [{ setNum: 1, weightLbs: 45, reps: 22, rpe: 9 }],
-      },
-    ],
-  },
-];

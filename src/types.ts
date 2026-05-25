@@ -1,5 +1,5 @@
 // src/types.ts
-import type { Timestamp } from "firebase/firestore"; // Type-only import
+import type { Timestamp } from "firebase/firestore";
 
 export interface SetEntry {
   setNum: number;
@@ -10,8 +10,12 @@ export interface SetEntry {
 
 export interface Exercise {
   name: string;
-  tempo: string;
-  sets: SetEntry[];
+  type: "strength" | "cardio";
+  tempo?: string;
+  sets?: SetEntry[];
+  distanceMiles?: number;
+  timeMinutes?: number;
+  exerciseNotes?: string;
 }
 
 export interface Workout {
@@ -29,9 +33,14 @@ export interface PersonalRecord {
   bestEstimated1RM: number;
 }
 
-// Fixed: Swapped out 'any' for the official Firestore Timestamp type
+// Fixed: Track objects with type info instead of a plain string array
+export interface StoredExerciseType {
+  name: string;
+  type: "strength" | "cardio";
+}
+
 export interface ExerciseMetadata {
-  exerciseNames: string[];
+  exerciseNames: StoredExerciseType[]; // Transformed from string[]
   records: Record<string, PersonalRecord>;
   lastUpdated?: Timestamp;
 }

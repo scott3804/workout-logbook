@@ -1,17 +1,40 @@
 // src/services/workoutService.ts
 import {
+  collection,
   doc,
-  getDoc,
   writeBatch,
   arrayUnion,
   Timestamp,
+  getDoc,
 } from "firebase/firestore";
-import { db } from "../../firebaseConfig";
-import type { Workout, Exercise, ExerciseMetadata } from "../types"; // Type-only imports
+import { db } from "../firebaseConfig";
+import type {
+  Workout,
+  Exercise,
+  ExerciseMetadata,
+  StoredExerciseType,
+} from "../types";
 
 function calculate1RM(weight: number, reps: number): number {
   if (reps <= 1) return weight;
   return Math.round(weight / (1.0278 - 0.0278 * reps));
+}
+
+/**
+ * Scrub any hidden "undefined" fields out of objects before they touch Firestore.
+ * Avoids 'any' usage entirely using strict key type indexes.
+ */
+function scrubUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
+  const result: Record<string, unknown> = {};
+
+  Object.keys(obj).forEach((key) => {
+    const value = obj[key];
+    if (value !== undefined) {
+      result[key] = value;
+    }
+  });
+
+  return result as Partial<T>;
 }
 
 export async function fetchExerciseMetadata(
@@ -19,49 +42,73 @@ export async function fetchExerciseMetadata(
 ): Promise<ExerciseMetadata> {
   const metaRef = doc(db, `users/${userId}/meta/exercises`);
   const metaSnap = await getDoc(metaRef);
-
-  if (metaSnap.exists()) {
-    return metaSnap.data() as ExerciseMetadata;
-  }
+  if (metaSnap.exists()) return metaSnap.data() as ExerciseMetadata;
   return { exerciseNames: [], records: {} };
 }
 
-export async function saveWorkoutSession(
+export async function saveCompleteWorkout(
   userId: string,
-  workoutData: Workout,
-  currentMeta: ExerciseMetadata, // Swapped 'any' for strict ExerciseMetadata type
+  workout: Workout,
+  currentMeta: ExerciseMetadata,
 ): Promise<void> {
   const batch = writeBatch(db);
-  const dateId = workoutData.date;
+  const workoutCollectionRef = collection(db, `users/${userId}/workouts`);
 
-  const workoutRef = doc(
-    db,
-    `users/${userId}/workouts/${dateId}-${workoutData.routine.toLowerCase().replace(/\s+/g, "-")}`,
+  // Clean the main workout data payload of any hidden undefined sub-properties
+  const cleanedExercises = workout.exercises.map((ex) => {
+    const baseClean = {
+      name: ex.name,
+      type: ex.type,
+      tempo: ex.tempo || null, // Firebase loves null, hates undefined
+      exerciseNotes: ex.exerciseNotes || null,
+      sets: ex.sets ? ex.sets.map((s) => ({ ...s })) : null,
+      distanceMiles: ex.distanceMiles !== undefined ? ex.distanceMiles : null,
+      timeMinutes: ex.timeMinutes !== undefined ? ex.timeMinutes : null,
+    };
+    return scrubUndefined(baseClean);
+  });
+
+  const workoutPayload = {
+    workoutId: workout.workoutId,
+    date: workout.date,
+    routine: workout.routine,
+    bodyWeightLbs: workout.bodyWeightLbs,
+    notes: workout.notes,
+    exercises: cleanedExercises,
+    createdAt: Timestamp.now(),
+  };
+
+  const workoutRef = doc(workoutCollectionRef, workout.workoutId);
+  batch.set(workoutRef, workoutPayload);
+
+  const existingExercisesMap = new Map<string, "strength" | "cardio">(
+    currentMeta.exerciseNames?.map((item) => [
+      item.name.toLowerCase(),
+      item.type,
+    ]) || [],
   );
-  batch.set(workoutRef, { ...workoutData, createdAt: Timestamp.now() });
 
-  const uniqueNames: string[] = [];
   const updatedRecords = { ...currentMeta.records };
 
-  workoutData.exercises.forEach((ex: Exercise) => {
-    uniqueNames.push(ex.name);
+  // Loop through exercises to calculate metrics
+  workout.exercises.forEach((ex: Exercise) => {
+    existingExercisesMap.set(ex.name.toLowerCase(), ex.type);
+
+    // If it's a cardio entry, do not process strength stats or personal records
+    if (ex.type === "cardio") return;
 
     let topWeight = 0;
     let max1RM = 0;
-    let totalVolume = 0;
 
-    ex.sets.forEach((set) => {
-      totalVolume += set.weightLbs * set.reps;
+    ex.sets?.forEach((set) => {
       if (set.weightLbs > topWeight) topWeight = set.weightLbs;
-
       const current1RM = calculate1RM(set.weightLbs, set.reps);
       if (current1RM > max1RM) max1RM = current1RM;
     });
 
     const snapshot = {
-      date: dateId,
+      date: workout.date,
       topWeightLbs: topWeight,
-      totalVolumeLbs: totalVolume,
       bestEstimated1RM: max1RM,
     };
 
@@ -80,17 +127,29 @@ export async function saveWorkoutSession(
     if (max1RM > pastBest) {
       updatedRecords[ex.name] = {
         maxWeightLbs: topWeight,
-        achievedDate: dateId,
+        achievedDate: workout.date,
         bestEstimated1RM: max1RM,
       };
     }
+  });
+
+  // Format the metadata names tracking array cleanly
+  const finalExerciseNamesArray: StoredExerciseType[] = [];
+  existingExercisesMap.forEach((type, name) => {
+    const match = currentMeta.exerciseNames?.find(
+      (e) => e.name.toLowerCase() === name,
+    );
+    finalExerciseNamesArray.push({
+      name: match ? match.name : name.charAt(0).toUpperCase() + name.slice(1),
+      type,
+    });
   });
 
   const metaRef = doc(db, `users/${userId}/meta/exercises`);
   batch.set(
     metaRef,
     {
-      exerciseNames: arrayUnion(...uniqueNames),
+      exerciseNames: finalExerciseNamesArray,
       records: updatedRecords,
       lastUpdated: Timestamp.now(),
     },
