@@ -1,26 +1,22 @@
+// vite.config.ts
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
-import tailwindcss from "@tailwindcss/vite"; // 1. Import the Tailwind plugin
 
 export default defineConfig({
   plugins: [
     react(),
-    tailwindcss(), // 2. Add it to the plugins array
     VitePWA({
       registerType: "autoUpdate",
-      includeAssets: [
-        "favicon.ico",
-        "apple-touch-icon.png",
-        "maskable-icon.svg",
-      ],
+      includeAssets: ["favicon.ico", "apple-touch-icon.png", "mask-icon.svg"],
       manifest: {
-        name: "Strength Logger PWA",
+        name: "FlexLog Hybrid Tracker",
         short_name: "FlexLog",
-        description: "Track workout progression and export JSON data",
-        theme_color: "#1f2937",
-        background_color: "#111827",
-        display: "standalone",
+        description:
+          "High-performance hybrid strength and cardio training logbook.",
+        theme_color: "#10b981", // Emerald 500 theme color accent
+        background_color: "#111827", // Gray 900 slate background
+        display: "standalone", // CRITICAL: This hides browser bars and forces native app mode
         orientation: "portrait",
         icons: [
           {
@@ -37,7 +33,7 @@ export default defineConfig({
             src: "pwa-512x512.png",
             sizes: "512x512",
             type: "image/png",
-            purpose: "any maskable",
+            purpose: "any maskable", // Perfect layout rendering for Android adaptive icons
           },
         ],
       },
